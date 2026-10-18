@@ -141,6 +141,27 @@ func spike(args []string) error {
 		fi, _ := out.Stat()
 		fmt.Printf("export: %s tar=%d bytes err=%v  %s\n", time.Since(start).Round(time.Millisecond), fi.Size(), err, cpuSince(c0))
 		return err
+	case "du": // time a containerd-style disk usage walk (Lstat every entry) of a directory
+		for i := 1; i <= 2; i++ {
+			start, c0 := time.Now(), cpuTimes()
+			var n int
+			var total int64
+			err := filepath.Walk(args[1], func(p string, fi os.FileInfo, err error) error {
+				if err != nil {
+					return err
+				}
+				n++
+				total += fi.Size()
+				return nil
+			})
+			fmt.Printf("du pass %d: %s entries=%d bytes=%d err=%v  %s\n", i, time.Since(start).Round(time.Millisecond), n, total, err, cpuSince(c0))
+		}
+		return nil
+	case "destroy": // remove a WCIFS layer directory the supported way
+		start := time.Now()
+		err := wclayer.DestroyLayer(ctx, args[1])
+		fmt.Printf("destroy: %s err=%v\n", time.Since(start).Round(time.Millisecond), err)
+		return err
 	case "importwc": // the current path: HCS ImportLayer into a standard layer dir
 		f, err := os.Open(args[1])
 		if err != nil {
