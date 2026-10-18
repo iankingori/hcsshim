@@ -91,6 +91,9 @@ func spike(args []string) error {
 			return err
 		}
 		fmt.Printf("scratch volume: %s\n", mp)
+		if !strings.HasSuffix(mp, `\`) {
+			mp += `\`
+		}
 		n := 0
 		filepath.WalkDir(mp, func(p string, d os.DirEntry, err error) error {
 			if err != nil {
@@ -101,7 +104,7 @@ func spike(args []string) error {
 				return nil
 			}
 			n++
-			if n <= 40 {
+			if n <= 400 {
 				info, _ := d.Info()
 				var attrs uint32
 				if info != nil {
@@ -118,6 +121,9 @@ func spike(args []string) error {
 			return nil
 		})
 		fmt.Printf("total entries: %d\n", n)
+		if b, err := os.ReadFile(filepath.Join(mp, `Windows\container_tombstones.json`)); err == nil {
+			fmt.Printf("container_tombstones.json: %s\n", b)
+		}
 		return nil
 	case "importwc": // the current path: HCS ImportLayer into a standard layer dir
 		f, err := os.Open(args[1])
