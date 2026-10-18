@@ -125,6 +125,22 @@ func spike(args []string) error {
 			fmt.Printf("container_tombstones.json: %s\n", b)
 		}
 		return nil
+	case "export": // cimprobe export <scratchDir> <out.tar>: scratch delta -> layer tar
+		if err := winio.EnableProcessPrivileges([]string{winio.SeBackupPrivilege, winio.SeRestorePrivilege}); err != nil {
+			return err
+		}
+		out, err := os.Create(args[2])
+		if err != nil {
+			return err
+		}
+		defer out.Close()
+		start, c0 := time.Now(), cpuTimes()
+		err = winio.RunWithPrivileges([]string{winio.SeSecurityPrivilege}, func() error {
+			return ociwcim.ExportScratchToTar(ctx, out, args[1])
+		})
+		fi, _ := out.Stat()
+		fmt.Printf("export: %s tar=%d bytes err=%v  %s\n", time.Since(start).Round(time.Millisecond), fi.Size(), err, cpuSince(c0))
+		return err
 	case "importwc": // the current path: HCS ImportLayer into a standard layer dir
 		f, err := os.Open(args[1])
 		if err != nil {
