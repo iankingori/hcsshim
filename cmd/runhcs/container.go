@@ -16,8 +16,10 @@ import (
 
 	winio "github.com/Microsoft/go-winio"
 	"github.com/Microsoft/go-winio/pkg/guid"
+	"github.com/Microsoft/hcsshim/computestorage"
 	"github.com/Microsoft/hcsshim/internal/cni"
 	"github.com/Microsoft/hcsshim/internal/hcs"
+	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	hcsv2 "github.com/Microsoft/hcsshim/internal/hcs/v2"
 	"github.com/Microsoft/hcsshim/internal/hcsoci"
 	"github.com/Microsoft/hcsshim/internal/layers"
@@ -28,14 +30,45 @@ import (
 	"github.com/Microsoft/hcsshim/internal/runhcs"
 	"github.com/Microsoft/hcsshim/internal/uvm"
 	"github.com/Microsoft/hcsshim/internal/wclayer"
+	cimlayer "github.com/Microsoft/hcsshim/internal/wclayer/cim"
 	"github.com/Microsoft/hcsshim/osversion"
 	"github.com/Microsoft/hcsshim/pkg/annotations"
+	"github.com/containerd/containerd/api/types"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/windows"
 )
 
 var errContainerStopped = errors.New("container is stopped")
+
+// rootfsMountAnnotation names a JSON file (absolute, or relative to the bundle) holding a single
+// containerd mount that describes the container's root file system, e.g. a forked CIM chain, in
+// place of Windows.LayerFolders.
+const rootfsMountAnnotation = "io.runhcs.rootfs-mount"
+
+// rootfsMounts returns the root file system mounts the caller supplied, or nil if the container
+// uses Windows.LayerFolders.
+func (c *container) rootfsMounts() ([]*types.Mount, error) {
+	if c.Spec == nil {
+		return nil, nil
+	}
+	f := c.Spec.Annotations[rootfsMountAnnotation]
+	if f == "" {
+		return nil, nil
+	}
+	if !filepath.IsAbs(f) {
+		f = filepath.Join(c.Bundle, f)
+	}
+	data, err := os.ReadFile(f)
+	if err != nil {
+		return nil, fmt.Errorf("read rootfs mount: %w", err)
+	}
+	var m types.Mount
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, fmt.Errorf("parse rootfs mount %s: %w", f, err)
+	}
+	return []*types.Mount{&m}, nil
+}
 
 type persistedState struct {
 	// ID is the id of this container/UVM.
@@ -527,7 +560,16 @@ func createContainerInHost(c *container, vm *uvm.UtilityVM) (err error) {
 	// hcsoci requires parsed WCOW layers rather than reading Spec.Windows.LayerFolders itself.
 	var wcowLayers layers.WCOWLayers
 	if c.Spec.Windows != nil && c.Spec.Linux == nil {
-		wcowLayers, err = layers.ParseWCOWLayers(nil, c.Spec.Windows.LayerFolders)
+		var rootfs []*types.Mount
+		rootfs, err = c.rootfsMounts()
+		if err != nil {
+			return err
+		}
+		if rootfs != nil {
+			wcowLayers, err = layers.ParseWCOWLayers(rootfs, nil)
+		} else {
+			wcowLayers, err = layers.ParseWCOWLayers(nil, c.Spec.Windows.LayerFolders)
+		}
 		if err != nil {
 			return err
 		}
@@ -711,6 +753,10 @@ func (c *container) releaseWCOWLayers() {
 	if !c.rootMountedByRunhcs() {
 		return // layers were mounted by the caller
 	}
+	if rootfs, err := c.rootfsMounts(); err == nil && rootfs != nil {
+		c.releaseCIMLayers(rootfs[0].Source)
+		return
+	}
 	folders := c.Spec.Windows.LayerFolders
 	if len(folders) == 0 {
 		return
@@ -723,6 +769,25 @@ func (c *container) releaseWCOWLayers() {
 		logrus.WithError(err).WithField("layer", scratch).Debug("deactivate layer")
 	}
 	logrus.WithField("layer", scratch).Debug("released scratch layer")
+}
+
+// releaseCIMLayers undoes the mounts hcsoci made for CIM layers: the union filter on the scratch,
+// the scratch activation and the CIM volume (named after the container ID). Best effort, like
+// releaseWCOWLayers.
+func (c *container) releaseCIMLayers(scratch string) {
+	ctx := context.Background()
+	if mountPath, err := wclayer.GetLayerMountPath(ctx, scratch); err == nil {
+		if err := computestorage.DetachOverlayFilter(ctx, mountPath, hcsschema.UnionFS); err != nil {
+			logrus.WithError(err).WithField("layer", scratch).Debug("detach overlay filter")
+		}
+	}
+	if err := wclayer.DeactivateLayer(ctx, scratch); err != nil {
+		logrus.WithError(err).WithField("layer", scratch).Debug("deactivate layer")
+	}
+	if err := cimlayer.CleanupContainerMounts(c.ID); err != nil {
+		logrus.WithError(err).WithField("container", c.ID).Debug("cleanup CIM mounts")
+	}
+	logrus.WithField("layer", scratch).Debug("released CIM layers")
 }
 
 // rootMountedByRunhcs reports whether runhcs (via hcsoci) mounted the layers, i.e. the bundle's

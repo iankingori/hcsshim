@@ -16,9 +16,14 @@ import (
 	"time"
 
 	"github.com/Microsoft/go-winio"
+	"github.com/Microsoft/go-winio/vhd"
+	"github.com/Microsoft/hcsshim/computestorage"
+	"github.com/Microsoft/hcsshim/internal/security"
+	"github.com/Microsoft/hcsshim/internal/wclayer"
 	"github.com/Microsoft/hcsshim/internal/wclayer/cim"
 	"github.com/Microsoft/hcsshim/pkg/ociwclayer"
 	ociwcim "github.com/Microsoft/hcsshim/pkg/ociwclayer/cim"
+	"golang.org/x/sys/windows"
 )
 
 // spike: cimprobe import <tar|tgz> <layerDir> <cimPath> [<parentLayerDir> <parentCimPath>]
@@ -50,6 +55,69 @@ func spike(args []string) error {
 			bytes += b + h.Size*0
 		}
 		fmt.Printf("scan: %s %d entries %d bytes  %s\n", time.Since(start).Round(time.Millisecond), n, bytes, cpuSince(c0))
+		return nil
+	case "scratch": // create an empty NTFS-formatted scratch VHDX the way the containerd cimfs snapshotter does
+		dir := args[1]
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+		p := filepath.Join(dir, "sandbox.vhdx")
+		start := time.Now()
+		h, err := vhd.CreateVirtualDisk(p, vhd.VirtualDiskAccessNone, vhd.CreateVirtualDiskFlagNone, &vhd.CreateVirtualDiskParameters{
+			Version:  2,
+			Version2: vhd.CreateVersion2{MaximumSize: 10 << 30, BlockSizeInBytes: 1 << 20},
+		})
+		if err != nil {
+			return fmt.Errorf("create vhd: %w", err)
+		}
+		err = computestorage.FormatWritableLayerVhd(ctx, windows.Handle(h))
+		syscall.CloseHandle(h)
+		if err != nil {
+			return fmt.Errorf("format vhd: %w", err)
+		}
+		if err := security.GrantVmGroupAccess(p); err != nil {
+			return fmt.Errorf("grant vm group access: %w", err)
+		}
+		fmt.Printf("scratch: %s %s\n", time.Since(start).Round(time.Millisecond), p)
+		return nil
+	case "rawscratch": // activate a CIM scratch layer without the union filter and list what the container left in it
+		dir := args[1]
+		if err := wclayer.ActivateLayer(ctx, dir); err != nil {
+			return fmt.Errorf("activate: %w", err)
+		}
+		defer wclayer.DeactivateLayer(ctx, dir)
+		mp, err := wclayer.GetLayerMountPath(ctx, dir)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("scratch volume: %s\n", mp)
+		n := 0
+		filepath.WalkDir(mp, func(p string, d os.DirEntry, err error) error {
+			if err != nil {
+				fmt.Printf("  walk error %s: %v\n", p, err)
+				return nil
+			}
+			if p == mp {
+				return nil
+			}
+			n++
+			if n <= 40 {
+				info, _ := d.Info()
+				var attrs uint32
+				if info != nil {
+					if sys, ok := info.Sys().(*syscall.Win32FileAttributeData); ok {
+						attrs = sys.FileAttributes
+					}
+				}
+				size := int64(0)
+				if info != nil {
+					size = info.Size()
+				}
+				fmt.Printf("  %s size=%d attrs=%#x\n", strings.TrimPrefix(p, mp), size, attrs)
+			}
+			return nil
+		})
+		fmt.Printf("total entries: %d\n", n)
 		return nil
 	case "importwc": // the current path: HCS ImportLayer into a standard layer dir
 		f, err := os.Open(args[1])
