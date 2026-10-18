@@ -11,12 +11,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	winio "github.com/Microsoft/go-winio"
 	"github.com/Microsoft/go-winio/pkg/guid"
 	"github.com/Microsoft/hcsshim/internal/cni"
 	"github.com/Microsoft/hcsshim/internal/hcs"
+	hcsv2 "github.com/Microsoft/hcsshim/internal/hcs/v2"
 	"github.com/Microsoft/hcsshim/internal/hcsoci"
 	"github.com/Microsoft/hcsshim/internal/layers"
 	"github.com/Microsoft/hcsshim/internal/logfields"
@@ -25,6 +27,7 @@ import (
 	"github.com/Microsoft/hcsshim/internal/resources"
 	"github.com/Microsoft/hcsshim/internal/runhcs"
 	"github.com/Microsoft/hcsshim/internal/uvm"
+	"github.com/Microsoft/hcsshim/internal/wclayer"
 	"github.com/Microsoft/hcsshim/osversion"
 	"github.com/Microsoft/hcsshim/pkg/annotations"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -85,7 +88,7 @@ const (
 type container struct {
 	persistedState
 	ShimPid int
-	hc      *hcs.System
+	hc      *hcsv2.System
 }
 
 func startProcessShim(id, pidFile, logFile string, spec *specs.Process) (_ *os.Process, err error) {
@@ -161,6 +164,18 @@ func launchShim(cmd, pidFile, logFile string, args []string, data interface{}) (
 	fullargs = append(fullargs, args...)
 	attr := &os.ProcAttr{
 		Files: []*os.File{rdatap, wp, log},
+	}
+	if cmd == "shim" {
+		// startProcessShim passes this process's stdio handle values to the shim as flags.
+		// Go only inherits handles that are listed explicitly, so list them or the shim
+		// would write the container's output to handles that don't exist in its process.
+		attr.Sys = &syscall.SysProcAttr{
+			AdditionalInheritedHandles: []syscall.Handle{
+				syscall.Handle(os.Stdin.Fd()),
+				syscall.Handle(os.Stdout.Fd()),
+				syscall.Handle(os.Stderr.Fd()),
+			},
+		}
 	}
 	p, err := os.StartProcess(executable, fullargs, attr)
 	if err != nil {
@@ -424,7 +439,7 @@ func createContainer(cfg *containerConfig) (_ *container, err error) {
 		if err != nil {
 			return nil, err
 		}
-		c.hc, err = hcs.OpenComputeSystem(context.Background(), cfg.ID)
+		c.hc, err = hcsv2.OpenComputeSystem(context.Background(), cfg.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -509,6 +524,15 @@ func createContainerInHost(c *container, vm *uvm.UtilityVM) (err error) {
 		return errors.New("container already created")
 	}
 
+	// hcsoci requires parsed WCOW layers rather than reading Spec.Windows.LayerFolders itself.
+	var wcowLayers layers.WCOWLayers
+	if c.Spec.Windows != nil && c.Spec.Linux == nil {
+		wcowLayers, err = layers.ParseWCOWLayers(nil, c.Spec.Windows.LayerFolders)
+		if err != nil {
+			return err
+		}
+	}
+
 	// Create the container without starting it.
 	opts := &hcsoci.CreateOptions{
 		ID:               c.ID,
@@ -516,6 +540,7 @@ func createContainerInHost(c *container, vm *uvm.UtilityVM) (err error) {
 		Spec:             c.Spec,
 		HostingSystem:    vm,
 		NetworkNamespace: c.RequestedNetNS,
+		WCOWLayers:       wcowLayers,
 	}
 	vmid := ""
 	if vm != nil {
@@ -549,7 +574,7 @@ func createContainerInHost(c *container, vm *uvm.UtilityVM) (err error) {
 	if err != nil {
 		return err
 	}
-	c.hc = hc.(*hcs.System)
+	c.hc = hc.(*hcsv2.System)
 	return nil
 }
 
@@ -640,10 +665,10 @@ func getContainer(id string, notStopped bool) (*container, error) {
 		return nil, errContainerStopped
 	}
 
-	hc, err := hcs.OpenComputeSystem(context.Background(), c.ID)
+	hc, err := hcsv2.OpenComputeSystem(context.Background(), c.ID)
 	if err == nil {
 		c.hc = hc
-	} else if !hcs.IsNotExist(err) {
+	} else if !hcsv2.IsNotExist(err) {
 		return nil, err
 	} else if notStopped {
 		return nil, errContainerStopped
@@ -658,6 +683,7 @@ func (c *container) Remove() error {
 	if err != nil {
 		return err
 	}
+	c.releaseWCOWLayers()
 
 	// Follow kata's example and delay tearing down the VM until the owning
 	// container is removed.
@@ -669,6 +695,49 @@ func (c *container) Remove() error {
 		}
 	}
 	return stateKey.Remove(c.ID)
+}
+
+// releaseWCOWLayers deactivates the scratch layer of a process-isolated Windows container.
+//
+// The layer closer lives only in memory (resources.Resources has no exported fields), so the
+// Resources runhcs saved in the registry release nothing and the layer would stay activated,
+// which makes any later commit of that layer fail with a sharing violation. This is best effort:
+// the layer may already be released.
+func (c *container) releaseWCOWLayers() {
+	logrus.WithFields(logrus.Fields{"spec": c.Spec != nil, "isHost": c.IsHost, "vmIsolated": c.VMIsolated()}).Debug("releaseWCOWLayers")
+	if c.Spec == nil || c.Spec.Windows == nil || c.Spec.Linux != nil || c.VMIsolated() {
+		return
+	}
+	if !c.rootMountedByRunhcs() {
+		return // layers were mounted by the caller
+	}
+	folders := c.Spec.Windows.LayerFolders
+	if len(folders) == 0 {
+		return
+	}
+	scratch := folders[len(folders)-1]
+	if err := wclayer.UnprepareLayer(context.Background(), scratch); err != nil {
+		logrus.WithError(err).WithField("layer", scratch).Debug("unprepare layer")
+	}
+	if err := wclayer.DeactivateLayer(context.Background(), scratch); err != nil {
+		logrus.WithError(err).WithField("layer", scratch).Debug("deactivate layer")
+	}
+	logrus.WithField("layer", scratch).Debug("released scratch layer")
+}
+
+// rootMountedByRunhcs reports whether runhcs (via hcsoci) mounted the layers, i.e. the bundle's
+// config.json has no root path. hcsoci overwrites Spec.Root.Path in place once it has mounted
+// them, so the in-memory spec can't be used for this.
+func (c *container) rootMountedByRunhcs() bool {
+	if c.Bundle != "" {
+		if data, err := os.ReadFile(filepath.Join(c.Bundle, "config.json")); err == nil {
+			var orig specs.Spec
+			if json.Unmarshal(data, &orig) == nil {
+				return orig.Root == nil || orig.Root.Path == ""
+			}
+		}
+	}
+	return c.Spec.Root == nil || c.Spec.Root.Path == ""
 }
 
 func (c *container) Kill() error {
