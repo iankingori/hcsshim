@@ -149,9 +149,13 @@ func main() {
 		}
 		switch logFormat = context.GlobalString("log-format"); logFormat {
 		case "text":
-			// retain logrus's default.
+			// retain logrus's default, except that debug logs get millisecond timestamps so that
+			// the phases of container start can be told apart.
+			if context.GlobalBool("debug") {
+				logrus.SetFormatter(&logrus.TextFormatter{FullTimestamp: true, TimestampFormat: "2006-01-02T15:04:05.000Z07:00"})
+			}
 		case "json":
-			logrus.SetFormatter(new(logrus.JSONFormatter))
+			logrus.SetFormatter(&logrus.JSONFormatter{TimestampFormat: "2006-01-02T15:04:05.000Z07:00"})
 		default:
 			return fmt.Errorf("unknown log-format %q", logFormat)
 		}
