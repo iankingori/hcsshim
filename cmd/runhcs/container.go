@@ -34,6 +34,12 @@ import (
 
 var errContainerStopped = errors.New("container is stopped")
 
+// terminateOnExitAnnotation makes the shim terminate the container as soon as its init process has
+// exited, instead of asking it to shut down gracefully. Callers that keep nothing running in the
+// container (a build step) use it to skip waiting for the container's services to wind down,
+// which occasionally takes ~25-30s.
+const terminateOnExitAnnotation = "io.runhcs.terminate-on-exit"
+
 type persistedState struct {
 	// ID is the id of this container/UVM.
 	ID string `json:",omitempty"`
