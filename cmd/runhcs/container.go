@@ -179,6 +179,10 @@ func launchShim(cmd, pidFile, logFile string, args []string, data interface{}) (
 
 	var log *os.File
 	fullargs := []string{os.Args[0]}
+	// The shim reads and writes the container's state, so it must use the same state root.
+	if stateRoot != "" {
+		fullargs = append(fullargs, "--root", stateRoot)
+	}
 	if logFile != "" {
 		if !strings.HasPrefix(logFile, runhcs.SafePipePrefix) {
 			log, err = os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND|os.O_SYNC, 0666)
