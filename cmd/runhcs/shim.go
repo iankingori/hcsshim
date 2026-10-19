@@ -210,18 +210,23 @@ var shimCommand = cli.Command{
 			// Shutdown the container, waiting 5 minutes before terminating is
 			// forcefully.
 			const shutdownTimeout = time.Minute * 5
-			err := c.hc.Shutdown(gcontext.Background())
-			if err != nil {
-				select {
-				case <-containerExitCh:
-					err = containerExitErr
-				case <-time.After(shutdownTimeout):
-					err = hcs.ErrTimeout
-				}
-			}
-
-			if err != nil {
+			if c.Spec != nil && c.Spec.Annotations[terminateOnExitAnnotation] == "true" {
+				// Nothing needs a clean shutdown: stop the container right away.
 				_ = c.hc.Terminate(gcontext.Background())
+			} else {
+				err := c.hc.Shutdown(gcontext.Background())
+				if err != nil {
+					select {
+					case <-containerExitCh:
+						err = containerExitErr
+					case <-time.After(shutdownTimeout):
+						err = hcs.ErrTimeout
+					}
+				}
+
+				if err != nil {
+					_ = c.hc.Terminate(gcontext.Background())
+				}
 			}
 			<-containerExitCh
 		}
