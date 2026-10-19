@@ -36,6 +36,9 @@ var stateKey *regstate.Key
 
 var logFormat string
 
+// stateRoot is the registry key the container state lives in (the global --root option).
+var stateRoot string
+
 const (
 	specConfig = "config.json"
 	usage      = `Open Container Initiative runtime for Windows
@@ -157,7 +160,8 @@ func main() {
 		}
 
 		var err error
-		stateKey, err = regstate.Open(context.GlobalString("root"), false)
+		stateRoot = context.GlobalString("root")
+		stateKey, err = regstate.Open(stateRoot, false)
 		if err != nil {
 			return err
 		}
